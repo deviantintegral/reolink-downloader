@@ -7,3 +7,10 @@ requires-python = ">=3.14"
 dependencies = [
     "reolink-aio>=0.16.4",
 ]
+
+[project.scripts]
+reolink-downloader = "reolink_downloader:main"
+
+[build-system]
+requires = ["uv_build>=0.9.7,<0.10.0"]
+build-backend = "uv_build"
