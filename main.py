@@ -26,7 +26,7 @@ async def download_videos(
     Download videos from Reolink camera within the specified date range.
 
     Args:
-        ip: Camera IP address
+        ip: Camera IP address or hostname
         username: Camera username
         password: Camera password
         start_time: Start of date range
@@ -184,7 +184,7 @@ def main():
     parser.add_argument(
         "--ip",
         required=True,
-        help="Camera IP address",
+        help="Camera IP address or hostname",
     )
     parser.add_argument(
         "--username",
