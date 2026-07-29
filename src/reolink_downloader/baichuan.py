@@ -1,6 +1,4 @@
-"""
-Standalone Baichuan (port 9000) VOD download client.
-"""
+"""Standalone Baichuan (port 9000) VOD download client."""
 
 from __future__ import annotations
 
@@ -16,13 +14,18 @@ from pathlib import Path
 
 from Cryptodome.Cipher import AES
 
-# --- protocol constants (see PROTOCOL.md) ---
+# Protocol constants
 MAGIC = bytes.fromhex("f0debc0a")
 DEFAULT_PORT = 9000
 AES_IV = b"0123456789abcdef"
 XML_KEY = (0x1F, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0xFF)
 
+CMD_LOGIN = 1
+CMD_DOWNLOAD = 143
 MEDIA_MESS_ID = 54
+
+MSG_CLASS_HANDSHAKE = "1465"
+MSG_CLASS_DATA = "1464"
 
 # BCMEDIA frame magics (little-endian u32)
 _M_INFO_V1, _M_INFO_V2 = 0x31303031, 0x32303031
@@ -34,34 +37,19 @@ _ENCLEN_RE = re.compile(rb"<[eE]ncryptLen>(\d+)</[eE]ncryptLen>")
 _NONCE_RE = re.compile(r"<nonce>([^<]+)</nonce>")
 
 _LOGIN_XML = (
-    '<?xml version="1.0" encoding="UTF-8" ?>\n'
-    "<body>\n"
-    '<LoginUser version="1.1">\n'
-    "<userName>{user}</userName>\n"
-    "<password>{password}</password>\n"
-    "<userVer>1</userVer>\n"
-    "</LoginUser>\n"
-    '<LoginNet version="1.1">\n'
-    "<type>LAN</type>\n"
-    "<udpPort>0</udpPort>\n"
-    "</LoginNet>\n"
-    "</body>\n"
+    '<?xml version="1.0" encoding="UTF-8" ?>\n<body>\n'
+    '<LoginUser version="1.1">\n<userName>{user}</userName>\n'
+    "<password>{password}</password>\n<userVer>1</userVer>\n</LoginUser>\n"
+    '<LoginNet version="1.1">\n<type>LAN</type>\n<udpPort>0</udpPort>\n</LoginNet>\n</body>\n'
 )
 
 _DOWNLOAD_XML = (
-    '<?xml version="1.0" encoding="UTF-8" ?>\n'
-    "<body>\n"
-    '<FileInfoList version="1.1">\n'
-    "<FileInfo>\n"
-    "<logicChnBitmap>{logic_bitmap}</logicChnBitmap>\n"
-    "<channelId>{channel}</channelId>\n"
-    "<supportSub>0</supportSub>\n"
-    "<streamType>{stream_type}</streamType>\n"
-    "<startTime>{start}</startTime>\n"
-    "<endTime>{end}</endTime>\n"
-    "</FileInfo>\n"
-    "</FileInfoList>\n"
-    "</body>\n"
+    '<?xml version="1.0" encoding="UTF-8" ?>\n<body>\n'
+    '<FileInfoList version="1.1">\n<FileInfo>\n'
+    "<logicChnBitmap>{logic_bitmap}</logicChnBitmap>\n<channelId>{channel}</channelId>\n"
+    "<supportSub>0</supportSub>\n<streamType>{stream_type}</streamType>\n"
+    "<startTime>{start}</startTime>\n<endTime>{end}</endTime>\n"
+    "</FileInfo>\n</FileInfoList>\n</body>\n"
 )
 
 
@@ -69,17 +57,31 @@ class BaichuanError(Exception):
     """A Baichuan protocol or connection error."""
 
 
+@dataclass
+class StreamInfo:
+    """Parsed BCMEDIA stream dimensions and frame counters."""
+
+    width: int = 0
+    height: int = 0
+    nominal_fps: int = 0
+    video_frames: int = 0
+    aac_frames: int = 0
+    adpcm_frames: int = 0
+
+
 def _u32(b: bytes) -> int:
     return struct.unpack("<I", b)[0]
 
 
+def _pad8(n: int) -> int:
+    return (8 - n % 8) % 8
+
+
 def _md5_modern(s: str) -> str:
-    """The MD5 variant Baichuan uses for nonce/key/login hashes."""
     return md5(s.encode("utf8")).hexdigest()[:31].upper()
 
 
 def _bc_crypt(buf: bytes, offset: int) -> bytes:
-    """Keyless BC XOR cipher (symmetric); ``offset`` is the message's mess_id."""
     o = offset % 256
     return bytes((b ^ XML_KEY[(o + i) % 8] ^ o) & 0xFF for i, b in enumerate(buf))
 
@@ -96,32 +98,57 @@ def _reolink_time(dt: datetime) -> str:
 
 
 def sniff_codec(vbuf: bytes) -> str:
-    i = checked = 0
-    while i < len(vbuf) - 5 and checked < 16:
-        if vbuf[i : i + 4] == b"\x00\x00\x00\x01" or vbuf[i : i + 3] == b"\x00\x00\x01":
-            off = 4 if vbuf[i : i + 4] == b"\x00\x00\x00\x01" else 3
-            b = vbuf[i + off]
-            if (b >> 1) & 0x3F in (32, 33, 34):  # HEVC VPS/SPS/PPS
-                return "h265"
-            if b & 0x1F == 7:  # H.264 SPS
-                return "h264"
-            i += off + 1
-            checked += 1
-        else:
-            i += 1
+    """Detect H.264 vs H.265 from Annex-B NAL headers."""
+    for match in re.finditer(rb"\x00\x00\x00?\x01(.)", vbuf[:100000]):
+        nal = match.group(1)[0]
+        if (nal >> 1) & 0x3F in (32, 33, 34):
+            return "h265"
+        if nal & 0x1F == 7:
+            return "h264"
     return "h264"
 
 
-def _pad8(n: int) -> int:
-    return (8 - n % 8) % 8
+def deframe_video(stream: bytes) -> tuple[bytearray, bytearray, StreamInfo]:
+    """Parse BCMEDIA stream into raw video, audio, and stream metadata."""
+    video_buf, audio_buf = bytearray(), bytearray()
+    info = StreamInfo()
+    offset, length = 0, len(stream)
 
+    while offset + 8 <= length:
+        magic = _u32(stream[offset : offset + 4])
+        if magic in (_M_INFO_V1, _M_INFO_V2):
+            header_size = _u32(stream[offset + 4 : offset + 8])
+            info.width = _u32(stream[offset + 8 : offset + 12])
+            info.height = _u32(stream[offset + 12 : offset + 16])
+            info.nominal_fps = stream[offset + 17]
+            offset += header_size
+        elif _M_IFRAME <= magic <= _M_PFRAME_LAST:
+            payload_size = _u32(stream[offset + 8 : offset + 12])
+            start = offset + 24 + _u32(stream[offset + 12 : offset + 16])
+            if start + payload_size > length:
+                break
+            video_buf += stream[start : start + payload_size]
+            info.video_frames += 1
+            offset = start + payload_size + _pad8(payload_size)
+        elif magic in (_M_AAC, _M_ADPCM):
+            payload_size = struct.unpack("<H", stream[offset + 4 : offset + 6])[0]
+            start = offset + 8
+            if start + payload_size > length:
+                break
+            audio_buf += stream[start : start + payload_size]
+            if magic == _M_AAC:
+                info.aac_frames += 1
+            else:
+                info.adpcm_frames += 1
+            offset = start + payload_size + _pad8(payload_size)
+        else:
+            break
 
-def _add_adts_header(aac_payload: bytes) -> bytes:
-    return aac_payload
+    return video_buf, audio_buf, info
 
 
 def _get_media_duration(path: Path) -> float | None:
-    """Query exact duration (in seconds) using ffprobe stream & format inspection."""
+    """Query exact stream or format duration using ffprobe."""
     cmd = [
         "ffprobe",
         "-v", "error",
@@ -132,113 +159,80 @@ def _get_media_duration(path: Path) -> float | None:
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
-            for line in res.stdout.strip().splitlines():
+            for line in res.stdout.splitlines():
                 val = line.strip()
                 if val and val != "N/A":
-                    try:
-                        dur = float(val)
-                        if dur > 0:
-                            return dur
-                    except ValueError:
-                        pass
+                    return float(val)
     except Exception:
         pass
     return None
 
 
-def _estimate_audio_duration(info: dict, audio_bytes: bytes) -> float | None:
-    """Calculate exact audio duration in Python from AAC frame count."""
-    aac_frames = info.get("aac_frames", 0)
-    if aac_frames > 0:
-        sample_rate = 16000  # Default Reolink AAC sample rate
-        if len(audio_bytes) >= 7 and audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xF0) == 0xF0:
-            sr_idx = (audio_bytes[2] >> 2) & 0x0F
-            sr_lut = {
-                0: 96000, 1: 88200, 2: 64000, 3: 48000, 4: 44100,
-                5: 32000, 6: 24000, 7: 22050, 8: 16000, 9: 12000,
-                10: 11025, 11: 8000, 12: 7350
-            }
-            sample_rate = sr_lut.get(sr_idx, 16000)
-        return (aac_frames * 1024) / float(sample_rate)
-    return None
+def _estimate_audio_duration(aac_frames: int, audio_bytes: bytes) -> float | None:
+    """Calculate exact AAC audio duration from frame count and header sample rate."""
+    if not aac_frames:
+        return None
+    sample_rate = 16000
+    if len(audio_bytes) >= 7 and audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xF0) == 0xF0:
+        sr_lut = {
+            0: 96000, 1: 88200, 2: 64000, 3: 48000, 4: 44100,
+            5: 32000, 6: 24000, 7: 22050, 8: 16000, 9: 12000,
+            10: 11025, 11: 8000, 12: 7350,
+        }
+        sample_rate = sr_lut.get((audio_bytes[2] >> 2) & 0x0F, 16000)
+    return (aac_frames * 1024) / float(sample_rate)
 
-def _estimate_audio_duration(info: dict, audio_bytes: bytes) -> float | None:
-    """Calculate exact audio duration in Python from AAC frame count."""
-    aac_frames = info.get("aac_frames", 0)
-    if aac_frames > 0:
-        sample_rate = 16000  # Default Reolink AAC sample rate
-        if len(audio_bytes) >= 7 and audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xF0) == 0xF0:
-            sr_idx = (audio_bytes[2] >> 2) & 0x0F
-            sr_lut = {
-                0: 96000, 1: 88200, 2: 64000, 3: 48000, 4: 44100,
-                5: 32000, 6: 24000, 7: 22050, 8: 16000, 9: 12000,
-                10: 11025, 11: 8000, 12: 7350
-            }
-            sample_rate = sr_lut.get(sr_idx, 16000)
-        return (aac_frames * 1024) / float(sample_rate)
-    return None
 
-def deframe_video(stream: bytes) -> tuple[bytearray, bytearray, dict | None]:
-    """Parse a BCMEDIA byte stream; return (annex_b_video, audio_aac_or_pcm, info_dict)."""
-    vbuf = bytearray()
-    abuf = bytearray()
-    info: dict | None = None
-    aac_frames = 0
-    adpcm_frames = 0
-    video_frames = 0
-    p, n = 0, len(stream)
-    while p + 8 <= n:
-        magic = _u32(stream[p : p + 4])
-        if magic in (_M_INFO_V1, _M_INFO_V2):
-            hs = _u32(stream[p + 4 : p + 8])
-            info = {
-                "width": _u32(stream[p + 8 : p + 12]),
-                "height": _u32(stream[p + 12 : p + 16]),
-                "fps": stream[p + 17],
-            }
-            p += hs
-        elif _M_IFRAME <= magic <= _M_PFRAME_LAST:
-            payload_size = _u32(stream[p + 8 : p + 12])
-            add_hdr = _u32(stream[p + 12 : p + 16])
-            start = p + 24 + add_hdr
-            data = stream[start : start + payload_size]
-            if len(data) < payload_size:
-                break
-            vbuf += data
-            video_frames += 1
-            p = start + payload_size + _pad8(payload_size)
-        elif magic == _M_AAC:
-            payload_size = struct.unpack("<H", stream[p + 4 : p + 6])[0]
-            start = p + 8
-            if start + payload_size > n:
-                break
-            audio_frame = stream[start : start + payload_size]
-            abuf += _add_adts_header(audio_frame)
-            aac_frames += 1
-            p = start + payload_size + _pad8(payload_size)
-        elif magic == _M_ADPCM:
-            payload_size = struct.unpack("<H", stream[p + 4 : p + 6])[0]
-            start = p + 8
-            if start + payload_size > n:
-                break
-            audio_frame = stream[start : start + payload_size]
-            abuf += audio_frame
-            adpcm_frames += 1
-            p = start + payload_size + _pad8(payload_size)
-        else:
-            break
+def _remux_to_mp4(
+    raw_path: Path,
+    mp4_path: Path,
+    *,
+    codec: str = "h264",
+    fps: float | None = None,
+    audio_path: Path | None = None,
+    debug: bool = False,
+) -> bool:
+    """Remux video and optional audio into MP4 with FFmpeg."""
+    has_audio = bool(audio_path and audio_path.exists())
+    input_format = "hevc" if codec in ("h265", "hevc") else "h264"
 
-    if info is None:
-        info = {}
-    info["aac_frames"] = aac_frames
-    info["adpcm_frames"] = adpcm_frames
-    info["video_frames"] = video_frames
-    return vbuf, abuf, info
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-f", input_format]
+    if fps and fps > 0:
+        cmd += ["-r", f"{fps:.6f}"]
+    cmd += ["-i", str(raw_path)]
+
+    if has_audio:
+        cmd += ["-i", str(audio_path)]
+
+    cmd += ["-c:v", "copy"]
+    if has_audio:
+        cmd += ["-c:a", "copy", "-map", "0:v", "-map", "1:a"]
+
+    if codec in ("h265", "hevc"):
+        cmd += ["-tag:v", "hvc1"]
+
+    cmd += ["-movflags", "+faststart", str(mp4_path)]
+
+    if debug:
+        print(f"  [bc] ffmpeg command: {' '.join(cmd)}")
+
+    try:
+        res = subprocess.run(
+            cmd,
+            stdout=None if debug else subprocess.DEVNULL,
+            stderr=None if debug else subprocess.DEVNULL,
+            timeout=300,
+        )
+        return res.returncode == 0 and mp4_path.exists()
+    except Exception as e:
+        if debug:
+            print(f"  [bc] ffmpeg exception: {type(e).__name__}: {e}")
+        return False
 
 
 @dataclass
 class BaichuanDownloader:
-    """Minimal async Baichuan client: connect → login → download one clip."""
+    """Async Baichuan client: connect -> login -> download."""
 
     host: str
     username: str
@@ -254,19 +248,16 @@ class BaichuanDownloader:
         if self.debug:
             print(f"  [bc] {msg}")
 
-    def _decrypt_control(self, body: bytes, mess_id: int, poff: int) -> str:
-        if not body or self._key is None:
+    def _decrypt_control(self, body: bytes, mess_id: int, offset: int = 0) -> str:
+        if not body or not self._key:
             return ""
         try:
-            seg = body[:poff] if poff else body
-            txt = _aes(self._key).decrypt(seg).decode("utf8", "replace")
-            if "<" in txt:
-                return " ".join(txt.split())
+            raw = _aes(self._key).decrypt(body[:offset] if offset else body)
         except Exception:
-            pass
-        return " ".join(_bc_crypt(body, mess_id).decode("utf8", "replace").split())
+            raw = _bc_crypt(body, mess_id)
+        return " ".join(raw.decode("utf8", "replace").split())
 
-    async def __aenter__(self) -> "BaichuanDownloader":
+    async def __aenter__(self) -> BaichuanDownloader:
         await self.connect()
         await self.login()
         return self
@@ -287,17 +278,13 @@ class BaichuanDownloader:
             self._writer = self._reader = None
 
     def _build(self, cmd_id: int, body: str, *, mess_id: int, message_class: str, aes: bool) -> bytes:
-        body_bytes = body.encode("utf8")
-        if aes:
-            assert self._key is not None
-            enc = _aes(self._key).encrypt(body_bytes) if body_bytes else b""
-        else:
-            enc = _bc_crypt(body_bytes, mess_id)
+        payload = body.encode("utf8")
+        enc = _aes(self._key).encrypt(payload) if aes and self._key else _bc_crypt(payload, mess_id)
         header = MAGIC + struct.pack("<III", cmd_id, len(enc), mess_id)
-        if message_class == "1465":
+        if message_class == MSG_CLASS_HANDSHAKE:
             header += bytes.fromhex("12dc1465")
-        elif message_class == "1464":
-            header += bytes.fromhex("00001464") + struct.pack("<I", 0)
+        elif message_class == MSG_CLASS_DATA:
+            header += bytes.fromhex("0000146400000000")
         else:
             raise BaichuanError(f"unsupported message_class {message_class}")
         return header + enc
@@ -312,59 +299,147 @@ class BaichuanDownloader:
         header = await self._reader.readexactly(20)
         if header[:4] != MAGIC:
             raise BaichuanError(f"bad magic {header[:4].hex()}")
+
         cmd_id, mess_len, mess_id = struct.unpack("<III", header[4:16])
         status = struct.unpack("<H", header[16:18])[0]
         mclass = header[18:20].hex()
-        poff = 0
-        if mclass in ("1464", "0000"):
-            poff = _u32(await self._reader.readexactly(4))
+        offset = _u32(await self._reader.readexactly(4)) if mclass in (MSG_CLASS_DATA, "0000") else 0
         body = await self._reader.readexactly(mess_len) if mess_len else b""
-        return cmd_id, mess_id, status, mclass, poff, body
+        return cmd_id, mess_id, status, mclass, offset, body
 
     async def login(self) -> None:
-        await self._send(1, "", mess_id=0, message_class="1465", aes=False)
+        await self._send(CMD_LOGIN, "", mess_id=0, message_class=MSG_CLASS_HANDSHAKE, aes=False)
         nonce = None
         for _ in range(8):
-            cmd_id, mess_id, status, mclass, poff, body = await self._read_message()
-            if cmd_id == 1 and body:
-                m = _NONCE_RE.search(_bc_crypt(body, mess_id).decode("utf8", "replace"))
+            cmd_id, _, _, _, _, body = await self._read_message()
+            if cmd_id == CMD_LOGIN and body:
+                m = _NONCE_RE.search(_bc_crypt(body, 0).decode("utf8", "replace"))
                 if m:
                     nonce = m.group(1)
                     break
         if not nonce:
             raise BaichuanError("did not receive a login nonce")
-        self._dbg(f"nonce={nonce}")
 
+        self._dbg(f"nonce={nonce}")
         self._key = _md5_modern(f"{nonce}-{self.password}")[:16].encode("utf8")
 
         xml = _LOGIN_XML.format(
             user=_md5_modern(f"{self.username}{nonce}"),
             password=_md5_modern(f"{self.password}{nonce}"),
         )
-        await self._send(1, xml, mess_id=0, message_class="1464", aes=False)
+        await self._send(CMD_LOGIN, xml, mess_id=0, message_class=MSG_CLASS_DATA, aes=False)
 
         for _ in range(8):
-            cmd_id, mess_id, status, mclass, poff, body = await self._read_message()
-            self._dbg(f"login recv cmd={cmd_id} status={status} class={mclass} len={len(body)}")
-            if cmd_id == 1:
+            cmd_id, _, status, _, _, _ = await self._read_message()
+            if cmd_id == CMD_LOGIN:
                 if status not in (0, 200):
                     raise BaichuanError(f"login failed, status {status}")
                 self._dbg("login OK")
                 return
         raise BaichuanError("no login response")
 
-    def _decrypt_media_body(self, body: bytes, poff: int) -> bytes:
-        """Decrypt payload bytes inside a media body message."""
+    def _decrypt_media_body(self, body: bytes, offset: int) -> bytes:
         assert self._key is not None
         enc_len = 0
-        if poff:
-            ext = _aes(self._key).decrypt(body[:poff])
+        if offset:
+            ext = _aes(self._key).decrypt(body[:offset])
             m = _ENCLEN_RE.search(ext)
             enc_len = int(m.group(1)) if m else 0
-        payload = body[poff:]
+        payload = body[offset:]
         enc_len = min(enc_len, len(payload))
         head = _aes(self._key).decrypt(payload[:enc_len]) if enc_len else b""
         return head + payload[enc_len:]
+
+    async def _fetch_media_stream(
+        self,
+        start: datetime,
+        end: datetime,
+        channel: int,
+        stream_type: str,
+        logic_bitmap: int,
+    ) -> bytearray:
+        req = _DOWNLOAD_XML.format(
+            logic_bitmap=logic_bitmap,
+            channel=channel,
+            stream_type=stream_type,
+            start=_reolink_time(start),
+            end=_reolink_time(end),
+        )
+        self._dbg(f"download request: channel={channel} stream={stream_type} bitmap={logic_bitmap} {start} - {end}")
+        await self._send(CMD_DOWNLOAD, req, mess_id=MEDIA_MESS_ID, message_class=MSG_CLASS_DATA, aes=True)
+
+        media = bytearray()
+        msg_count = 0
+
+        while True:
+            try:
+                cmd_id, mess_id, status, _, offset, body = await self._read_message()
+            except (asyncio.IncompleteReadError, ConnectionError) as e:
+                self._dbg(f"stream closed after {msg_count} msgs ({type(e).__name__})")
+                break
+
+            if cmd_id != CMD_DOWNLOAD or not body:
+                if not body and cmd_id == CMD_DOWNLOAD:
+                    self._dbg(f"end-of-stream marker after {msg_count} media msgs")
+                    break
+                continue
+
+            if offset == 0:
+                continue
+
+            chunk = self._decrypt_media_body(body, offset)
+            if msg_count == 0:
+                self._dbg(f"first media chunk: offset={offset} len={len(body)}")
+            media += chunk
+            msg_count += 1
+
+        self._dbg(f"collected {len(media)} media bytes from {msg_count} messages")
+        return media
+
+    def _compute_effective_fps(
+        self,
+        info: StreamInfo,
+        audio_path: Path | None,
+        audio_bytes: bytes,
+    ) -> float | None:
+        if not info.video_frames:
+            return float(info.nominal_fps) if info.nominal_fps else None
+
+        audio_dur = _get_media_duration(audio_path) if audio_path and audio_path.exists() else None
+        if not audio_dur or audio_dur <= 0:
+            audio_dur = _estimate_audio_duration(info.aac_frames, audio_bytes)
+
+        if audio_dur and audio_dur > 0:
+            fps = info.video_frames / audio_dur
+            self._dbg(f"calculated dynamic fps={fps:.6f} ({info.video_frames} frames / {audio_dur:.3f}s audio)")
+            return fps
+
+        return float(info.nominal_fps) if info.nominal_fps else None
+
+    def _remux_clip(
+        self,
+        raw_path: Path,
+        audio_path: Path | None,
+        mp4_path: Path,
+        codec: str,
+        fps: float | None,
+    ) -> Path:
+        has_audio = bool(audio_path and audio_path.exists())
+
+        if has_audio and _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=audio_path, debug=self.debug):
+            raw_path.unlink(missing_ok=True)
+            audio_path.unlink(missing_ok=True)
+            return mp4_path
+
+        if has_audio:
+            self._dbg("ffmpeg remux with audio failed, trying video-only")
+            audio_path.unlink(missing_ok=True)
+
+        if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=None, debug=self.debug):
+            raw_path.unlink(missing_ok=True)
+            return mp4_path
+
+        return raw_path
 
     async def download(
         self,
@@ -377,158 +452,29 @@ class BaichuanDownloader:
         logic_bitmap: int = 255,
         remux_mp4: bool = True,
     ) -> Path:
-        if self._key is None:
+        """Download recording range to output path."""
+        if not self._key:
             raise BaichuanError("not logged in")
 
-        req = _DOWNLOAD_XML.format(
-            logic_bitmap=logic_bitmap,
-            channel=channel,
-            stream_type=stream_type,
-            start=_reolink_time(start),
-            end=_reolink_time(end),
-        )
-        self._dbg(f"download request: channel={channel} stream={stream_type} "
-                  f"bitmap={logic_bitmap} {start} - {end}")
-        await self._send(143, req, mess_id=MEDIA_MESS_ID, message_class="1464", aes=True)
-
-        media = bytearray()
-        nmsg = 0
-        while True:
-            try:
-                cmd_id, mess_id, status, mclass, poff, body = await self._read_message()
-            except (asyncio.IncompleteReadError, ConnectionError) as e:
-                self._dbg(f"stream closed after {nmsg} media msgs ({type(e).__name__})")
-                break
-            if cmd_id != 143:
-                if self.debug and (status not in (0, 200) or body):
-                    self._dbg(f"recv cmd={cmd_id} status={status} class={mclass} "
-                              f"len={len(body)} :: {self._decrypt_control(body, mess_id, poff)[:200]}")
-                continue
-            if not body:
-                self._dbg(f"end-of-stream marker (cmd143 len=0) after {nmsg} media msgs")
-                break
-            if poff == 0:
-                if self.debug:
-                    self._dbg(f"control cmd143 len={len(body)} :: "
-                              f"{self._decrypt_control(body, mess_id, 0)[:120]}")
-                continue
-            chunk = self._decrypt_media_body(body, poff)
-            if nmsg == 0:
-                self._dbg(f"first media chunk: poff={poff} len={len(body)} "
-                          f"decoded_head={chunk[:8].hex()}")
-            media += chunk
-            nmsg += 1
-        self._dbg(f"collected {len(media)} media bytes from {nmsg} media messages")
-
+        media = await self._fetch_media_stream(start, end, channel, stream_type, logic_bitmap)
         video, audio, info = deframe_video(bytes(media))
         if not video:
             raise BaichuanError("no video frames decoded (wrong time range or password?)")
 
         codec = sniff_codec(bytes(video))
-        aac_frames = info.get("aac_frames", 0) if info else 0
-        adpcm_frames = info.get("adpcm_frames", 0) if info else 0
-        self._dbg(f"decoded {codec} {info} video_bytes={len(video)} audio_bytes={len(audio)} "
-                  f"aac_frames={aac_frames} adpcm_frames={adpcm_frames}")
-        
+        self._dbg(f"decoded {codec} {info} video_bytes={len(video)} audio_bytes={len(audio)}")
+
         raw_path = out_path.with_suffix(f".{codec}")
         raw_path.write_bytes(video)
-        
+
         audio_path: Path | None = None
         if audio:
             audio_path = out_path.with_suffix(".aac")
             audio_path.write_bytes(audio)
-            self._dbg(f"wrote {len(audio)} audio bytes to {audio_path.name}")
 
-        if remux_mp4 and shutil.which("ffmpeg"):
-            mp4_path = out_path.with_suffix(".mp4")
-            
-            video_frames = info.get("video_frames", 0) if info else 0
-            nominal_fps = info.get("fps") if info else None
-            effective_fps: float | None = float(nominal_fps) if nominal_fps else None
+        if not (remux_mp4 and shutil.which("ffmpeg")):
+            return raw_path
 
-            if audio_path and audio_path.exists() and video_frames > 0:
-                # 1. Try ffprobe stream duration
-                audio_dur = _get_media_duration(audio_path)
-                # 2. Fall back to pure Python frame count calculation
-                if not audio_dur or audio_dur <= 0:
-                    audio_dur = _estimate_audio_duration(info, bytes(audio))
-
-                if audio_dur and audio_dur > 0:
-                    effective_fps = video_frames / audio_dur
-                    self._dbg(
-                        f"calculated dynamic fps={effective_fps:.6f} "
-                        f"({video_frames} video frames / {audio_dur:.3f}s audio)"
-                    )
-
-            self._dbg(f"attempting ffmpeg remux: fps={effective_fps} audio={audio_path}")
-            
-            if audio_path and audio_path.exists():
-                if _remux_to_mp4(
-                    raw_path,
-                    mp4_path,
-                    codec=codec,
-                    fps=effective_fps,
-                    audio_path=audio_path,
-                    audio_delay=0.0,
-                    debug=self.debug,
-                ):
-                    raw_path.unlink(missing_ok=True)
-                    audio_path.unlink(missing_ok=True)
-                    return mp4_path
-                else:
-                    self._dbg("ffmpeg remux with audio failed, trying video-only")
-                    audio_path.unlink(missing_ok=True)
-            
-            if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=effective_fps, audio_path=None, debug=self.debug):
-                raw_path.unlink(missing_ok=True)
-                return mp4_path
-
-def _remux_to_mp4(
-    raw_path: Path,
-    mp4_path: Path,
-    *,
-    codec: str = "h264",
-    fps: float | None = None,
-    audio_path: Path | None = None,
-    audio_delay: float = 0.0,
-    debug: bool = False,
-) -> bool:
-    """Remux a raw elementary stream into MP4 with ffmpeg."""
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
-
-    # FFmpeg's demuxer name for raw H.265 is 'hevc', not 'h265'
-    input_format = "hevc" if codec in ("h265", "hevc") else "h264"
-    cmd += ["-f", input_format]
-
-    if fps and fps > 0:
-        cmd += ["-r", f"{fps:.6f}"]
-    cmd += ["-i", str(raw_path)]
-
-    if audio_path and audio_path.exists():
-        if audio_delay != 0.0:
-            cmd += ["-itsoffset", str(audio_delay)]
-        cmd += ["-i", str(audio_path)]
-
-    cmd += ["-c:v", "copy"]
-    if audio_path and audio_path.exists():
-        cmd += ["-c:a", "copy"]
-
-    if codec in ("h265", "hevc"):
-        cmd += ["-tag:v", "hvc1"]
-
-    if audio_path and audio_path.exists():
-        cmd += ["-map", "0:v", "-map", "1:a"]
-
-    cmd += ["-movflags", "+faststart", str(mp4_path)]
-
-    try:
-        if debug:
-            print(f"ffmpeg command: {' '.join(str(x) for x in cmd)}")
-        stderr_dest = None if debug else subprocess.DEVNULL
-        stdout_dest = None if debug else subprocess.DEVNULL
-        result = subprocess.run(cmd, stdout=stdout_dest, stderr=stderr_dest, timeout=300)
-        return result.returncode == 0 and mp4_path.exists()
-    except Exception as e:
-        if debug:
-            print(f"ffmpeg exception: {type(e).__name__}: {e}")
-        return False
+        mp4_path = out_path.with_suffix(".mp4")
+        fps = self._compute_effective_fps(info, audio_path, bytes(audio))
+        return self._remux_clip(raw_path, audio_path, mp4_path, codec, fps)
