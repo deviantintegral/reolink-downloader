@@ -99,7 +99,7 @@ def _reolink_time(dt: datetime) -> str:
 
 def sniff_codec(vbuf: bytes) -> str:
     """Detect H.264 vs H.265 from Annex-B NAL headers."""
-    for match in re.finditer(rb"\x00\x00\x00?\x01(.)", vbuf[:100000]):
+    for match in re.finditer(rb"\x00\x00\x00?\x01(.)", vbuf[:100000], re.DOTALL):
         nal = match.group(1)[0]
         if (nal >> 1) & 0x3F in (32, 33, 34):
             return "h265"
@@ -117,12 +117,18 @@ def deframe_video(stream: bytes) -> tuple[bytearray, bytearray, StreamInfo]:
     while offset + 8 <= length:
         magic = _u32(stream[offset : offset + 4])
         if magic in (_M_INFO_V1, _M_INFO_V2):
+            if offset + 18 > length:
+                break  # truncated info frame
             header_size = _u32(stream[offset + 4 : offset + 8])
+            if header_size < 8:
+                break  # corrupt: would not advance
             info.width = _u32(stream[offset + 8 : offset + 12])
             info.height = _u32(stream[offset + 12 : offset + 16])
             info.nominal_fps = stream[offset + 17]
             offset += header_size
         elif _M_IFRAME <= magic <= _M_PFRAME_LAST:
+            if offset + 24 > length:
+                break  # truncated frame header
             payload_size = _u32(stream[offset + 8 : offset + 12])
             start = offset + 24 + _u32(stream[offset + 12 : offset + 16])
             if start + payload_size > length:
@@ -135,8 +141,11 @@ def deframe_video(stream: bytes) -> tuple[bytearray, bytearray, StreamInfo]:
             start = offset + 8
             if start + payload_size > length:
                 break
-            audio_buf += stream[start : start + payload_size]
+            # Only AAC payloads are raw ADTS frames that ffmpeg can copy as-is.
+            # ADPCM blocks carry their own per-block header and a different
+            # codec entirely, so they are counted but not collected.
             if magic == _M_AAC:
+                audio_buf += stream[start : start + payload_size]
                 info.aac_frames += 1
             else:
                 info.adpcm_frames += 1
@@ -249,13 +258,16 @@ class BaichuanDownloader:
             print(f"  [bc] {msg}")
 
     def _decrypt_control(self, body: bytes, mess_id: int, offset: int = 0) -> str:
+        """Best-effort decrypt of a control body for debugging (AES, else BC)."""
         if not body or not self._key:
             return ""
         try:
-            raw = _aes(self._key).decrypt(body[:offset] if offset else body)
+            txt = _aes(self._key).decrypt(body[:offset] if offset else body).decode("utf8", "replace")
+            if "<" in txt:
+                return " ".join(txt.split())
         except Exception:
-            raw = _bc_crypt(body, mess_id)
-        return " ".join(raw.decode("utf8", "replace").split())
+            pass
+        return " ".join(_bc_crypt(body, mess_id).decode("utf8", "replace").split())
 
     async def __aenter__(self) -> BaichuanDownloader:
         await self.connect()
@@ -279,7 +291,12 @@ class BaichuanDownloader:
 
     def _build(self, cmd_id: int, body: str, *, mess_id: int, message_class: str, aes: bool) -> bytes:
         payload = body.encode("utf8")
-        enc = _aes(self._key).encrypt(payload) if aes and self._key else _bc_crypt(payload, mess_id)
+        if aes:
+            if not self._key:
+                raise BaichuanError("cannot build an AES message before login")
+            enc = _aes(self._key).encrypt(payload)
+        else:
+            enc = _bc_crypt(payload, mess_id)
         header = MAGIC + struct.pack("<III", cmd_id, len(enc), mess_id)
         if message_class == MSG_CLASS_HANDSHAKE:
             header += bytes.fromhex("12dc1465")
@@ -311,9 +328,9 @@ class BaichuanDownloader:
         await self._send(CMD_LOGIN, "", mess_id=0, message_class=MSG_CLASS_HANDSHAKE, aes=False)
         nonce = None
         for _ in range(8):
-            cmd_id, _, _, _, _, body = await self._read_message()
+            cmd_id, mess_id, _, _, _, body = await self._read_message()
             if cmd_id == CMD_LOGIN and body:
-                m = _NONCE_RE.search(_bc_crypt(body, 0).decode("utf8", "replace"))
+                m = _NONCE_RE.search(_bc_crypt(body, mess_id).decode("utf8", "replace"))
                 if m:
                     nonce = m.group(1)
                     break
@@ -373,18 +390,31 @@ class BaichuanDownloader:
 
         while True:
             try:
-                cmd_id, mess_id, status, _, offset, body = await self._read_message()
+                cmd_id, mess_id, status, mclass, offset, body = await self._read_message()
             except (asyncio.IncompleteReadError, ConnectionError) as e:
                 self._dbg(f"stream closed after {msg_count} msgs ({type(e).__name__})")
                 break
 
-            if cmd_id != CMD_DOWNLOAD or not body:
-                if not body and cmd_id == CMD_DOWNLOAD:
-                    self._dbg(f"end-of-stream marker after {msg_count} media msgs")
-                    break
+            if cmd_id != CMD_DOWNLOAD:
+                # Surface any error/control reply (e.g. status 400) for debugging.
+                if self.debug and (status not in (0, 200) or body):
+                    self._dbg(
+                        f"recv cmd={cmd_id} status={status} class={mclass} len={len(body)} "
+                        f":: {self._decrypt_control(body, mess_id, offset)[:200]}"
+                    )
                 continue
 
+            if not body:
+                self._dbg(f"end-of-stream marker after {msg_count} media msgs")
+                break
+
             if offset == 0:
+                # An AES-encrypted XML control message (status/info), not media.
+                if self.debug:
+                    self._dbg(
+                        f"control cmd{CMD_DOWNLOAD} len={len(body)} "
+                        f":: {self._decrypt_control(body, mess_id)[:120]}"
+                    )
                 continue
 
             chunk = self._decrypt_media_body(body, offset)
@@ -402,19 +432,26 @@ class BaichuanDownloader:
         audio_path: Path | None,
         audio_bytes: bytes,
     ) -> float | None:
+        nominal = float(info.nominal_fps) if info.nominal_fps else None
         if not info.video_frames:
-            return float(info.nominal_fps) if info.nominal_fps else None
+            return nominal
 
-        audio_dur = _get_media_duration(audio_path) if audio_path and audio_path.exists() else None
+        # Frame count x samples-per-frame is exact; ffprobe's duration for a raw
+        # ADTS file is only estimated from bitrate, so it is the fallback.
+        audio_dur = _estimate_audio_duration(info.aac_frames, audio_bytes)
         if not audio_dur or audio_dur <= 0:
-            audio_dur = _estimate_audio_duration(info.aac_frames, audio_bytes)
+            audio_dur = _get_media_duration(audio_path) if audio_path and audio_path.exists() else None
 
         if audio_dur and audio_dur > 0:
             fps = info.video_frames / audio_dur
+            if nominal and not (nominal / 2 <= fps <= nominal * 2):
+                # Truncated or partial audio would otherwise skew playback speed.
+                self._dbg(f"ignoring implausible fps={fps:.6f}, falling back to nominal {nominal}")
+                return nominal
             self._dbg(f"calculated dynamic fps={fps:.6f} ({info.video_frames} frames / {audio_dur:.3f}s audio)")
             return fps
 
-        return float(info.nominal_fps) if info.nominal_fps else None
+        return nominal
 
     def _remux_clip(
         self,
@@ -426,19 +463,21 @@ class BaichuanDownloader:
     ) -> Path:
         has_audio = bool(audio_path and audio_path.exists())
 
-        if has_audio and _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=audio_path, debug=self.debug):
-            raw_path.unlink(missing_ok=True)
-            audio_path.unlink(missing_ok=True)
-            return mp4_path
-
         if has_audio:
+            if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=audio_path, debug=self.debug):
+                raw_path.unlink(missing_ok=True)
+                audio_path.unlink(missing_ok=True)
+                return mp4_path
             self._dbg("ffmpeg remux with audio failed, trying video-only")
-            audio_path.unlink(missing_ok=True)
 
         if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=None, debug=self.debug):
             raw_path.unlink(missing_ok=True)
+            if has_audio:
+                audio_path.unlink(missing_ok=True)
             return mp4_path
 
+        # Both attempts failed: drop any half-written mp4, keep the raw streams.
+        mp4_path.unlink(missing_ok=True)
         return raw_path
 
     async def download(
@@ -467,13 +506,13 @@ class BaichuanDownloader:
         raw_path = out_path.with_suffix(f".{codec}")
         raw_path.write_bytes(video)
 
+        if not (remux_mp4 and shutil.which("ffmpeg")):
+            return raw_path
+
         audio_path: Path | None = None
         if audio:
             audio_path = out_path.with_suffix(".aac")
             audio_path.write_bytes(audio)
-
-        if not (remux_mp4 and shutil.which("ffmpeg")):
-            return raw_path
 
         mp4_path = out_path.with_suffix(".mp4")
         fps = self._compute_effective_fps(info, audio_path, bytes(audio))
