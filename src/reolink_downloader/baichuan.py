@@ -443,9 +443,9 @@ class BaichuanDownloader:
             fps = info.get("fps") if info else None
             self._dbg(f"attempting ffmpeg remux: fps={fps} audio={audio_path}")
             
-            # Try with audio if available
+            # Try with audio if available (apply -3 second delay to sync audio that's lagging)
             if audio_path and audio_path.exists():
-                if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=audio_path, debug=self.debug):
+                if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=audio_path, audio_delay=-3.0, debug=self.debug):
                     raw_path.unlink(missing_ok=True)
                     audio_path.unlink(missing_ok=True)
                     return mp4_path
@@ -477,7 +477,7 @@ class BaichuanDownloader:
         return head + payload[enc_len:]
 
 
-def _remux_to_mp4(raw_path: Path, mp4_path: Path, *, codec: str = "h264", fps: int | None = None, audio_path: Path | None = None, debug: bool = False) -> bool:
+def _remux_to_mp4(raw_path: Path, mp4_path: Path, *, codec: str = "h264", fps: int | None = None, audio_path: Path | None = None, audio_delay: float = 0.0, debug: bool = False) -> bool:
     """Remux a raw elementary stream into MP4 with ffmpeg (copy, no transcode).
 
     A raw Annex-B stream has no container timing, so we pass the real frame rate
@@ -485,6 +485,8 @@ def _remux_to_mp4(raw_path: Path, mp4_path: Path, *, codec: str = "h264", fps: i
     than ffmpeg's default ``hev1`` so the result plays in QuickTime/Apple players.
     
     If audio_path is provided, both video and audio streams are muxed together.
+    The audio_delay parameter (in seconds) can be used to sync audio if it's ahead/behind.
+    Negative values mean audio plays earlier (correction for audio lag).
     """
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
     
@@ -496,8 +498,10 @@ def _remux_to_mp4(raw_path: Path, mp4_path: Path, *, codec: str = "h264", fps: i
     
     cmd += ["-i", str(raw_path)]
     
-    # Add audio input if provided
+    # Add audio input if provided with optional delay correction
     if audio_path and audio_path.exists():
+        if audio_delay != 0.0:
+            cmd += ["-itsoffset", str(audio_delay)]
         cmd += ["-i", str(audio_path)]
     
     # Codec specifications: use copy for both video and audio
