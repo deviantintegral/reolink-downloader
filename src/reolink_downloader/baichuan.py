@@ -496,8 +496,10 @@ def _remux_to_mp4(
     """Remux a raw elementary stream into MP4 with ffmpeg."""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
 
-    # Specify raw input format and calculated input framerate BEFORE input file
-    cmd += ["-f", codec]
+    # FFmpeg's demuxer name for raw H.265 is 'hevc', not 'h265'
+    input_format = "hevc" if codec in ("h265", "hevc") else "h264"
+    cmd += ["-f", input_format]
+
     if fps and fps > 0:
         cmd += ["-r", f"{fps:.6f}"]
     cmd += ["-i", str(raw_path)]
@@ -511,7 +513,7 @@ def _remux_to_mp4(
     if audio_path and audio_path.exists():
         cmd += ["-c:a", "copy"]
 
-    if codec == "h265":
+    if codec in ("h265", "hevc"):
         cmd += ["-tag:v", "hvc1"]
 
     if audio_path and audio_path.exists():
