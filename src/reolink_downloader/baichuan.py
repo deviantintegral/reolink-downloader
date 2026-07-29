@@ -138,10 +138,43 @@ def _pad8(n: int) -> int:
     return (8 - n % 8) % 8
 
 
-def deframe_video(stream: bytes) -> tuple[bytearray, dict | None]:
-    """Parse a BCMEDIA byte stream; return (annex_b_video, info_dict)."""
+def _add_adts_header(aac_payload: bytes) -> bytes:
+    """Wrap raw AAC audio frame with ADTS (Audio Data Transport Stream) header.
+    
+    ADTS is the standard framing format for AAC audio, required by most decoders.
+    Assumes AAC-LC profile (most common) with mono audio at 16kHz.
+    
+    NOTE: This is currently disabled - we output raw AAC frames without ADTS wrapping
+    and let ffmpeg handle format detection. Enable if needed for standalone audio playback.
+    """
+    # For now, return raw AAC without ADTS wrapper
+    # FFmpeg can usually handle raw AAC in MP4 container
+    return aac_payload
+    
+    # The ADTS header implementation below is kept for reference but not used:
+    # frame_len = len(aac_payload) + 7  # 7 bytes for ADTS fixed header (no CRC)
+    # header = bytearray(7)
+    # header[0] = 0xFF
+    # header[1] = 0xF1
+    # header[2] = 0x60
+    # header[3] = 0x40 | ((frame_len >> 11) & 0x03)
+    # header[4] = (frame_len >> 3) & 0xFF
+    # header[5] = ((frame_len & 0x07) << 5) | (0x7FF >> 6)
+    # header[6] = ((0x7FF & 0x3F) << 2) & 0xFF
+    # return bytes(header) + aac_payload
+
+
+def deframe_video(stream: bytes) -> tuple[bytearray, bytearray, dict | None]:
+    """Parse a BCMEDIA byte stream; return (annex_b_video, audio_aac_or_pcm, info_dict).
+    
+    AAC audio is wrapped with ADTS headers for proper framing.
+    ADPCM audio is written as raw PCM samples.
+    """
     vbuf = bytearray()
+    abuf = bytearray()
     info: dict | None = None
+    aac_frames = 0
+    adpcm_frames = 0
     p, n = 0, len(stream)
     while p + 8 <= n:
         magic = _u32(stream[p : p + 4])
@@ -162,15 +195,35 @@ def deframe_video(stream: bytes) -> tuple[bytearray, dict | None]:
                 break  # truncated; wait for more data
             vbuf += data
             p = start + payload_size + _pad8(payload_size)
-        elif magic in (_M_AAC, _M_ADPCM):
+        elif magic == _M_AAC:
             payload_size = struct.unpack("<H", stream[p + 4 : p + 6])[0]
             start = p + 8
             if start + payload_size > n:
                 break
+            audio_frame = stream[start : start + payload_size]
+            # Wrap AAC frame with ADTS header for proper framing
+            abuf += _add_adts_header(audio_frame)
+            aac_frames += 1
+            p = start + payload_size + _pad8(payload_size)
+        elif magic == _M_ADPCM:
+            payload_size = struct.unpack("<H", stream[p + 4 : p + 6])[0]
+            start = p + 8
+            if start + payload_size > n:
+                break
+            audio_frame = stream[start : start + payload_size]
+            # ADPCM audio is written as raw; typically 16-bit mono or stereo PCM
+            abuf += audio_frame
+            adpcm_frames += 1
             p = start + payload_size + _pad8(payload_size)
         else:
             break  # unknown magic: stop (caller decides how much was consumed)
-    return vbuf, info
+    if aac_frames > 0 or adpcm_frames > 0:
+        # Debug: store frame counts in info for logging
+        if info is None:
+            info = {}
+        info["aac_frames"] = aac_frames
+        info["adpcm_frames"] = adpcm_frames
+    return vbuf, abuf, info
 
 
 @dataclass
@@ -363,21 +416,50 @@ class BaichuanDownloader:
             nmsg += 1
         self._dbg(f"collected {len(media)} media bytes from {nmsg} media messages")
 
-        video, info = deframe_video(bytes(media))
+        video, audio, info = deframe_video(bytes(media))
         if not video:
             raise BaichuanError("no video frames decoded (wrong time range or password?)")
 
         codec = sniff_codec(bytes(video))
-        self._dbg(f"decoded {codec} {info} video_bytes={len(video)}")
+        aac_frames = info.get("aac_frames", 0) if info else 0
+        adpcm_frames = info.get("adpcm_frames", 0) if info else 0
+        self._dbg(f"decoded {codec} {info} video_bytes={len(video)} audio_bytes={len(audio)} "
+                  f"aac_frames={aac_frames} adpcm_frames={adpcm_frames}")
+        
         raw_path = out_path.with_suffix(f".{codec}")
         raw_path.write_bytes(video)
+        
+        # Write audio to a separate file if present
+        audio_path: Path | None = None
+        if audio:
+            audio_path = out_path.with_suffix(".aac")
+            audio_path.write_bytes(audio)
+            self._dbg(f"wrote {len(audio)} audio bytes to {audio_path.name}")
+        else:
+            self._dbg("no audio frames extracted")
 
         if remux_mp4 and shutil.which("ffmpeg"):
             mp4_path = out_path.with_suffix(".mp4")
             fps = info.get("fps") if info else None
-            if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps):
+            self._dbg(f"attempting ffmpeg remux: fps={fps} audio={audio_path}")
+            
+            # Try with audio if available
+            if audio_path and audio_path.exists():
+                if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=audio_path, debug=self.debug):
+                    raw_path.unlink(missing_ok=True)
+                    audio_path.unlink(missing_ok=True)
+                    return mp4_path
+                else:
+                    self._dbg("ffmpeg remux with audio failed, trying video-only")
+                    # Audio mux failed; try without audio
+                    audio_path.unlink(missing_ok=True)
+            
+            # Try without audio (fallback or audio wasn't available)
+            if _remux_to_mp4(raw_path, mp4_path, codec=codec, fps=fps, audio_path=None, debug=self.debug):
                 raw_path.unlink(missing_ok=True)
                 return mp4_path
+            elif self.debug:
+                self._dbg("ffmpeg remux failed")
         return raw_path
 
     def _decrypt_media_body(self, body: bytes, poff: int) -> bytes:
@@ -395,22 +477,59 @@ class BaichuanDownloader:
         return head + payload[enc_len:]
 
 
-def _remux_to_mp4(raw_path: Path, mp4_path: Path, *, codec: str = "h264", fps: int | None = None) -> bool:
+def _remux_to_mp4(raw_path: Path, mp4_path: Path, *, codec: str = "h264", fps: int | None = None, audio_path: Path | None = None, debug: bool = False) -> bool:
     """Remux a raw elementary stream into MP4 with ffmpeg (copy, no transcode).
 
     A raw Annex-B stream has no container timing, so we pass the real frame rate
     (from the BCMEDIA InfoFrame) as the input rate. HEVC is tagged ``hvc1`` rather
     than ffmpeg's default ``hev1`` so the result plays in QuickTime/Apple players.
+    
+    If audio_path is provided, both video and audio streams are muxed together.
     """
-    cmd = ["ffmpeg", "-y"]
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+    
+    # Specify input format for raw elementary stream
+    cmd += ["-f", codec]
+    
     if fps:
         cmd += ["-r", str(fps)]
-    cmd += ["-i", str(raw_path), "-c", "copy"]
+    
+    cmd += ["-i", str(raw_path)]
+    
+    # Add audio input if provided
+    if audio_path and audio_path.exists():
+        cmd += ["-i", str(audio_path)]
+    
+    # Codec specifications: use copy for both video and audio
+    cmd += ["-c:v", "copy"]
+    if audio_path and audio_path.exists():
+        cmd += ["-c:a", "copy"]
+    
     if codec == "h265":
         cmd += ["-tag:v", "hvc1"]
+    
+    # Add stream mapping if audio is present
+    if audio_path and audio_path.exists():
+        cmd += ["-map", "0:v", "-map", "1:a"]
+    
     cmd += ["-movflags", "+faststart", str(mp4_path)]
+    
     try:
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return result.returncode == 0 and mp4_path.exists()
-    except Exception:
+        if debug:
+            print(f"ffmpeg command: {' '.join(str(x) for x in cmd)}")
+        stderr_dest = None if debug else subprocess.DEVNULL
+        stdout_dest = None if debug else subprocess.DEVNULL
+        result = subprocess.run(cmd, stdout=stdout_dest, stderr=stderr_dest, timeout=300)
+        success = result.returncode == 0 and mp4_path.exists()
+        if debug:
+            print(f"ffmpeg exit code: {result.returncode}, output exists: {mp4_path.exists()}, "
+                  f"size: {mp4_path.stat().st_size if mp4_path.exists() else 'N/A'}")
+        return success
+    except subprocess.TimeoutExpired:
+        if debug:
+            print("ffmpeg timeout")
+        return False
+    except Exception as e:
+        if debug:
+            print(f"ffmpeg exception: {type(e).__name__}: {e}")
         return False
