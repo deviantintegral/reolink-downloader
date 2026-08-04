@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 reolink-downloader = "reolink_downloader:main"
+reolink-downloader-lite = "reolink_downloader.downloader_lite:main"
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
