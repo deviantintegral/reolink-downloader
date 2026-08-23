@@ -33,10 +33,12 @@ uv tool install git+https://github.com/deviantintegral/reolink-downloader
 
 ```
 $ uv tool run reolink-downloader --help
-usage: reolink-downloader [-h] --ip IP --username USERNAME --password PASSWORD --start-time START_TIME --end-time END_TIME
-[--output OUTPUT]
+usage: reolink-downloader [-h] --ip IP --username USERNAME --password PASSWORD
+[--start-time START_TIME] [--end-time END_TIME] [--future-days FUTURE_DAYS]
+[--stop-after-empty-days STOP_AFTER_EMPTY_DAYS] [--max-discovery-days MAX_DISCOVERY_DAYS]
+[--stop-at-existing] [--output OUTPUT] [--lens {wide,telephoto,both}]
 
-Download videos from a Reolink camera within a specified date range
+Download videos from a Reolink camera within a specified or auto-discovered date range
 
 options:
 -h, --help            show this help message and exit
@@ -44,7 +46,27 @@ options:
 --username USERNAME   Camera username
 --password PASSWORD   Camera password
 --start-time START_TIME
-Start date/time (e.g., '2024-01-01' or '2024-01-01 14:30:00')
---end-time END_TIME   End date/time (e.g., '2024-01-02' or '2024-01-02 14:30:00')
+Start date/time (e.g., '2024-01-01' or '2024-01-01 14:30:00'). If omitted,
+recordings are auto-discovered backwards from --end-time or now.
+--end-time END_TIME   End date/time (e.g., '2024-01-02' or '2024-01-02 14:30:00').
+Defaults to now when --start-time is omitted.
+--future-days FUTURE_DAYS
+When auto-discovering, search this many days after --end-time or now before
+scanning backwards (default: 2)
+--stop-after-empty-days STOP_AFTER_EMPTY_DAYS
+When auto-discovering, stop after this many consecutive days with no recordings
+(default: 7)
+--max-discovery-days MAX_DISCOVERY_DAYS
+When auto-discovering, stop after checking this many days (default: 365)
+--stop-at-existing    When auto-discovering, stop scanning backwards once a matching existing download
+is found in the output directory
 --output OUTPUT       Output directory for downloaded videos (default: ./downloads)
+--lens {wide,telephoto,both}
+Which lens to download on dual-lens cameras like the TrackMix PoE (default:
+both). Cameras without a separate telephoto stream only download wide.
 ```
+
+If `--start-time` is omitted, the downloader searches backwards day by day, starting at
+`--end-time` (or now) plus `--future-days`. It stops once it sees
+`--stop-after-empty-days` consecutive days with no recordings across the selected lenses,
+or once `--max-discovery-days` have been checked.
